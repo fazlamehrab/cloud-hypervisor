@@ -1224,7 +1224,7 @@ dependencies = [
 [[package]]
 name = "vm-fdt"
 version = "0.1.0"
-source = "git+https://github.com/rust-vmm/vm-fdt?branch=master#13ab882e2f8387753064351c69fbe35c422b448b"
+source = "git+https://github.com/rust-vmm/vm-fdt?branch=master#02d1b8fde288f42b4e2c0a0ec036f70ab797141c"
 
 [[package]]
 name = "vm-memory"
