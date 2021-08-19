@@ -11,7 +11,7 @@ use super::{
 use crate::seccomp_filters::{get_seccomp_filter, Thread};
 use crate::GuestMemoryMmap;
 use crate::{DmaRemapping, VirtioInterrupt, VirtioInterruptType};
-use seccomp::{SeccompAction, SeccompFilter};
+use seccompiler::{apply_filter, SeccompAction};
 use std::collections::BTreeMap;
 use std::fmt::{self, Display};
 use std::io;
@@ -850,9 +850,14 @@ impl VirtioDevice for Iommu {
         thread::Builder::new()
             .name(self.id.clone())
             .spawn(move || {
-                if let Err(e) = SeccompFilter::apply(virtio_iommu_seccomp_filter) {
-                    error!("Error applying seccomp filter: {:?}", e);
-                } else if let Err(e) = handler.run(paused, paused_sync.unwrap()) {
+                if !virtio_iommu_seccomp_filter.is_empty() {
+                    if let Err(e) = apply_filter(&virtio_iommu_seccomp_filter) {
+                        error!("Error applying seccomp filter: {:?}", e);
+                        return;
+                    }
+                }
+
+                if let Err(e) = handler.run(paused, paused_sync.unwrap()) {
                     error!("Error running worker: {:?}", e);
                 }
             })

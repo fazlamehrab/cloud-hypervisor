@@ -23,6 +23,7 @@ mod tests {
     use std::io;
     use std::io::BufRead;
     use std::io::Read;
+    use std::io::Seek;
     use std::io::Write;
     use std::os::unix::io::AsRawFd;
     use std::path::PathBuf;
@@ -70,6 +71,10 @@ mod tests {
     const FOCAL_IMAGE_NAME_VHD: &str = "focal-server-cloudimg-arm64-custom.vhd";
     #[cfg(target_arch = "x86_64")]
     const FOCAL_IMAGE_NAME_VHD: &str = "focal-server-cloudimg-amd64-custom-20210609-0.vhd";
+    #[cfg(target_arch = "aarch64")]
+    const FOCAL_IMAGE_NAME_VHDX: &str = "focal-server-cloudimg-arm64-custom.vhdx";
+    #[cfg(target_arch = "x86_64")]
+    const FOCAL_IMAGE_NAME_VHDX: &str = "focal-server-cloudimg-amd64-custom-20210609-0.vhdx";
     #[cfg(target_arch = "x86_64")]
     const WINDOWS_IMAGE_NAME: &str = "windows-server-2019.raw";
     #[cfg(target_arch = "x86_64")]
@@ -921,6 +926,96 @@ mod tests {
                     .unwrap_or(0),
                 packages
             );
+        });
+
+        let _ = child.kill();
+        let output = child.wait_with_output().unwrap();
+
+        handle_child_output(r, &output);
+    }
+
+    #[allow(unused_variables)]
+    fn test_guest_numa_nodes(acpi: bool) {
+        let focal = UbuntuDiskConfig::new(FOCAL_IMAGE_NAME.to_string());
+        let guest = Guest::new(Box::new(focal));
+        let api_socket = temp_api_path(&guest.tmp_dir);
+        #[cfg(target_arch = "x86_64")]
+        let kernel_path = direct_kernel_boot_path();
+        #[cfg(target_arch = "aarch64")]
+        let kernel_path = if acpi {
+            edk2_path()
+        } else {
+            direct_kernel_boot_path()
+        };
+
+        let mut child = GuestCommand::new(&guest)
+            .args(&["--cpus", "boot=6,max=12"])
+            .args(&["--memory", "size=0,hotplug_method=virtio-mem"])
+            .args(&[
+                "--memory-zone",
+                "id=mem0,size=1G,hotplug_size=3G",
+                "id=mem1,size=2G,hotplug_size=3G",
+                "id=mem2,size=3G,hotplug_size=3G",
+            ])
+            .args(&[
+                "--numa",
+                "guest_numa_id=0,cpus=0-2:9,distances=1@15:2@20,memory_zones=mem0",
+                "guest_numa_id=1,cpus=3-4:6-8,distances=0@20:2@25,memory_zones=mem1",
+                "guest_numa_id=2,cpus=5:10-11,distances=0@25:1@30,memory_zones=mem2",
+            ])
+            .args(&["--kernel", kernel_path.to_str().unwrap()])
+            .args(&["--cmdline", DIRECT_KERNEL_BOOT_CMDLINE])
+            .args(&["--api-socket", &api_socket])
+            .capture_output()
+            .default_disks()
+            .default_net()
+            .spawn()
+            .unwrap();
+
+        let r = std::panic::catch_unwind(|| {
+            guest.wait_vm_boot(None).unwrap();
+
+            // Check each NUMA node has been assigned the right amount of
+            // memory.
+            assert!(guest.get_numa_node_memory(0).unwrap_or_default() > 960_000);
+            assert!(guest.get_numa_node_memory(1).unwrap_or_default() > 1_920_000);
+            assert!(guest.get_numa_node_memory(2).unwrap_or_default() > 2_880_000);
+
+            // Check each NUMA node has been assigned the right CPUs set.
+            guest.check_numa_node_cpus(0, vec![0, 1, 2]).unwrap();
+            guest.check_numa_node_cpus(1, vec![3, 4]).unwrap();
+            guest.check_numa_node_cpus(2, vec![5]).unwrap();
+
+            // Check each NUMA node has been assigned the right distances.
+            assert!(guest.check_numa_node_distances(0, "10 15 20").unwrap());
+            assert!(guest.check_numa_node_distances(1, "20 10 25").unwrap());
+            assert!(guest.check_numa_node_distances(2, "25 30 10").unwrap());
+
+            // AArch64 currently does not support hotplug, and therefore we only
+            // test hotplug-related function on x86_64 here.
+            #[cfg(target_arch = "x86_64")]
+            {
+                guest.enable_memory_hotplug();
+
+                // Resize every memory zone and check each associated NUMA node
+                // has been assigned the right amount of memory.
+                resize_zone_command(&api_socket, "mem0", "4G");
+                thread::sleep(std::time::Duration::new(5, 0));
+                assert!(guest.get_numa_node_memory(0).unwrap_or_default() > 3_840_000);
+                resize_zone_command(&api_socket, "mem1", "4G");
+                thread::sleep(std::time::Duration::new(5, 0));
+                assert!(guest.get_numa_node_memory(1).unwrap_or_default() > 3_840_000);
+                resize_zone_command(&api_socket, "mem2", "4G");
+                thread::sleep(std::time::Duration::new(5, 0));
+                assert!(guest.get_numa_node_memory(2).unwrap_or_default() > 3_840_000);
+
+                // Resize to the maximum amount of CPUs and check each NUMA
+                // node has been assigned the right CPUs set.
+                resize_command(&api_socket, Some(12), None, None);
+                guest.check_numa_node_cpus(0, vec![0, 1, 2, 9]).unwrap();
+                guest.check_numa_node_cpus(1, vec![3, 4, 6, 7, 8]).unwrap();
+                guest.check_numa_node_cpus(2, vec![5, 10, 11]).unwrap();
+            }
         });
 
         let _ = child.kill();
@@ -1893,6 +1988,8 @@ mod tests {
     }
 
     mod parallel {
+        use std::io::SeekFrom;
+
         use crate::tests::*;
 
         #[test]
@@ -2251,90 +2348,14 @@ mod tests {
 
         #[test]
         #[cfg(feature = "acpi")]
-        fn test_guest_numa_nodes() {
-            let focal = UbuntuDiskConfig::new(FOCAL_IMAGE_NAME.to_string());
-            let guest = Guest::new(Box::new(focal));
-            let api_socket = temp_api_path(&guest.tmp_dir);
+        fn test_guest_numa_nodes_acpi() {
+            test_guest_numa_nodes(true);
+        }
 
-            #[cfg(target_arch = "x86_64")]
-            let kernel_path = direct_kernel_boot_path();
-            #[cfg(target_arch = "aarch64")]
-            let kernel_path = edk2_path();
-
-            let mut child = GuestCommand::new(&guest)
-                .args(&["--cpus", "boot=6,max=12"])
-                .args(&["--memory", "size=0,hotplug_method=virtio-mem"])
-                .args(&[
-                    "--memory-zone",
-                    "id=mem0,size=1G,hotplug_size=3G",
-                    "id=mem1,size=2G,hotplug_size=3G",
-                    "id=mem2,size=3G,hotplug_size=3G",
-                ])
-                .args(&[
-                    "--numa",
-                    "guest_numa_id=0,cpus=0-2:9,distances=1@15:2@20,memory_zones=mem0",
-                    "guest_numa_id=1,cpus=3-4:6-8,distances=0@20:2@25,memory_zones=mem1",
-                    "guest_numa_id=2,cpus=5:10-11,distances=0@25:1@30,memory_zones=mem2",
-                ])
-                .args(&["--kernel", kernel_path.to_str().unwrap()])
-                .args(&["--cmdline", DIRECT_KERNEL_BOOT_CMDLINE])
-                .args(&["--api-socket", &api_socket])
-                .capture_output()
-                .default_disks()
-                .default_net()
-                .spawn()
-                .unwrap();
-
-            let r = std::panic::catch_unwind(|| {
-                guest.wait_vm_boot(None).unwrap();
-
-                // Check each NUMA node has been assigned the right amount of
-                // memory.
-                assert!(guest.get_numa_node_memory(0).unwrap_or_default() > 960_000);
-                assert!(guest.get_numa_node_memory(1).unwrap_or_default() > 1_920_000);
-                assert!(guest.get_numa_node_memory(2).unwrap_or_default() > 2_880_000);
-
-                // Check each NUMA node has been assigned the right CPUs set.
-                guest.check_numa_node_cpus(0, vec![0, 1, 2]).unwrap();
-                guest.check_numa_node_cpus(1, vec![3, 4]).unwrap();
-                guest.check_numa_node_cpus(2, vec![5]).unwrap();
-
-                // Check each NUMA node has been assigned the right distances.
-                assert!(guest.check_numa_node_distances(0, "10 15 20").unwrap());
-                assert!(guest.check_numa_node_distances(1, "20 10 25").unwrap());
-                assert!(guest.check_numa_node_distances(2, "25 30 10").unwrap());
-
-                // AArch64 currently does not support hotplug, and therefore we only
-                // test hotplug-related function on x86_64 here.
-                #[cfg(target_arch = "x86_64")]
-                {
-                    guest.enable_memory_hotplug();
-
-                    // Resize every memory zone and check each associated NUMA node
-                    // has been assigned the right amount of memory.
-                    resize_zone_command(&api_socket, "mem0", "4G");
-                    thread::sleep(std::time::Duration::new(5, 0));
-                    assert!(guest.get_numa_node_memory(0).unwrap_or_default() > 3_840_000);
-                    resize_zone_command(&api_socket, "mem1", "4G");
-                    thread::sleep(std::time::Duration::new(5, 0));
-                    assert!(guest.get_numa_node_memory(1).unwrap_or_default() > 3_840_000);
-                    resize_zone_command(&api_socket, "mem2", "4G");
-                    thread::sleep(std::time::Duration::new(5, 0));
-                    assert!(guest.get_numa_node_memory(2).unwrap_or_default() > 3_840_000);
-
-                    // Resize to the maximum amount of CPUs and check each NUMA
-                    // node has been assigned the right CPUs set.
-                    resize_command(&api_socket, Some(12), None, None);
-                    guest.check_numa_node_cpus(0, vec![0, 1, 2, 9]).unwrap();
-                    guest.check_numa_node_cpus(1, vec![3, 4, 6, 7, 8]).unwrap();
-                    guest.check_numa_node_cpus(2, vec![5, 10, 11]).unwrap();
-                }
-            });
-
-            let _ = child.kill();
-            let output = child.wait_with_output().unwrap();
-
-            handle_child_output(r, &output);
+        #[test]
+        #[cfg(target_arch = "aarch64")]
+        fn test_guest_numa_nodes_dt() {
+            test_guest_numa_nodes(false);
         }
 
         #[test]
@@ -2546,6 +2567,120 @@ mod tests {
                 .expect("Expect generating VHD image from RAW image");
 
             _test_virtio_block(FOCAL_IMAGE_NAME_VHD, false)
+        }
+
+        #[test]
+        fn test_virtio_block_vhdx() {
+            let mut workload_path = dirs::home_dir().unwrap();
+            workload_path.push("workloads");
+
+            let mut raw_file_path = workload_path.clone();
+            let mut vhdx_file_path = workload_path;
+            raw_file_path.push(FOCAL_IMAGE_NAME);
+            vhdx_file_path.push(FOCAL_IMAGE_NAME_VHDX);
+
+            // Generate dynamic VHDX file from RAW file
+            std::process::Command::new("qemu-img")
+                .arg("convert")
+                .arg("-p")
+                .args(&["-f", "raw"])
+                .args(&["-O", "vhdx"])
+                .arg(raw_file_path.to_str().unwrap())
+                .arg(vhdx_file_path.to_str().unwrap())
+                .output()
+                .expect("Expect generating dynamic VHDx image from RAW image");
+
+            _test_virtio_block(FOCAL_IMAGE_NAME_VHDX, false)
+        }
+
+        #[test]
+        fn test_virtio_block_dynamic_vhdx_expand() {
+            const VIRTUAL_DISK_SIZE: u64 = 100 << 20;
+            const EMPTY_VHDX_FILE_SIZE: u64 = 8 << 20;
+            const FULL_VHDX_FILE_SIZE: u64 = 112 << 20;
+            const DYNAMIC_VHDX_NAME: &str = "dynamic.vhdx";
+
+            let mut workload_path = dirs::home_dir().unwrap();
+            workload_path.push("workloads");
+
+            let mut vhdx_file_path = workload_path;
+            vhdx_file_path.push(DYNAMIC_VHDX_NAME);
+            let vhdx_path = vhdx_file_path.to_str().unwrap();
+
+            // Generate a 100 MiB dynamic VHDX file
+            std::process::Command::new("qemu-img")
+                .arg("create")
+                .args(&["-f", "vhdx"])
+                .arg(vhdx_path)
+                .arg(VIRTUAL_DISK_SIZE.to_string())
+                .output()
+                .expect("Expect generating dynamic VHDx image from RAW image");
+
+            // Check if the size matches with empty VHDx file size
+            assert_eq!(vhdx_image_size(vhdx_path), EMPTY_VHDX_FILE_SIZE);
+
+            let focal = UbuntuDiskConfig::new(FOCAL_IMAGE_NAME.to_string());
+            let guest = Guest::new(Box::new(focal));
+            let kernel_path = direct_kernel_boot_path();
+
+            let mut cloud_child = GuestCommand::new(&guest)
+                .args(&["--cpus", "boot=1"])
+                .args(&["--memory", "size=512M"])
+                .args(&["--kernel", kernel_path.to_str().unwrap()])
+                .args(&["--cmdline", DIRECT_KERNEL_BOOT_CMDLINE])
+                .args(&[
+                    "--disk",
+                    format!(
+                        "path={}",
+                        guest.disk_config.disk(DiskType::OperatingSystem).unwrap()
+                    )
+                    .as_str(),
+                    format!(
+                        "path={}",
+                        guest.disk_config.disk(DiskType::CloudInit).unwrap()
+                    )
+                    .as_str(),
+                    format!("path={}", vhdx_path).as_str(),
+                ])
+                .default_net()
+                .capture_output()
+                .spawn()
+                .unwrap();
+
+            let r = std::panic::catch_unwind(|| {
+                guest.wait_vm_boot(None).unwrap();
+
+                // Check both if /dev/vdc exists and if the block size is 100 MiB.
+                assert_eq!(
+                    guest
+                        .ssh_command("lsblk | grep vdc | grep -c 100M")
+                        .unwrap()
+                        .trim()
+                        .parse::<u32>()
+                        .unwrap_or_default(),
+                    1
+                );
+
+                // Write 100 MB of data to the VHDx disk
+                guest
+                    .ssh_command("sudo dd if=/dev/urandom of=/dev/vdc bs=1M count=100")
+                    .unwrap();
+            });
+
+            // Check if the size matches with expected expanded VHDx file size
+            assert_eq!(vhdx_image_size(vhdx_path), FULL_VHDX_FILE_SIZE);
+
+            let _ = cloud_child.kill();
+            let output = cloud_child.wait_with_output().unwrap();
+
+            handle_child_output(r, &output);
+        }
+
+        fn vhdx_image_size(disk_name: &str) -> u64 {
+            std::fs::File::open(disk_name)
+                .unwrap()
+                .seek(SeekFrom::End(0))
+                .unwrap()
         }
 
         #[test]

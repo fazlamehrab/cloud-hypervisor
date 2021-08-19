@@ -44,9 +44,9 @@ dependencies = [
 
 [[package]]
 name = "anyhow"
-version = "1.0.42"
+version = "1.0.43"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "595d3cfa7a60d4555cb5067b99f07142a08ea778de5cf993f7b75c7d8fabc486"
+checksum = "28ae2b3dec75a406790005a200b1bd89785afc02517a00ca99ecfe093ee9e6cf"
 
 [[package]]
 name = "api_client"
@@ -126,9 +126,9 @@ dependencies = [
 
 [[package]]
 name = "bitflags"
-version = "1.2.1"
+version = "1.3.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cf1de2fe8c75bc145a2f577add951f8134889b4795d47466a54a5c846d691693"
+checksum = "bef38d45163c2f1dde094a7dfd33ccf595c92905c8f8f4fdc18d06fb1037718a"
 
 [[package]]
 name = "block_util"
@@ -141,6 +141,7 @@ dependencies = [
  "thiserror",
  "versionize",
  "versionize_derive",
+ "vhdx",
  "virtio-bindings",
  "vm-memory 0.6.0",
  "vm-virtio",
@@ -204,7 +205,7 @@ dependencies = [
  "log",
  "net_util",
  "option_parser",
- "seccomp",
+ "seccompiler",
  "serde_json",
  "signal-hook",
  "test_infra",
@@ -222,6 +223,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ddfc5b9aa5d4507acaf872de71051dfd0e309860e88966e1051e462a077aac4f"
 dependencies = [
  "bitflags",
+]
+
+[[package]]
+name = "crc32c"
+version = "0.6.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "210cdf933e6a81212bfabf90cd8762f471b5922e5f6b709547673ad8e04b9448"
+dependencies = [
+ "rustc_version",
 ]
 
 [[package]]
@@ -524,9 +534,9 @@ dependencies = [
 
 [[package]]
 name = "memchr"
-version = "2.4.0"
+version = "2.4.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b16bd47d9e329435e309c58469fe0791c2d0d1ba96ec0954152a5ae2b04387dc"
+checksum = "308cc39be01b73d0d18f82a0e7b2a3df85245f84af96fdddc5d202d27e47b86a"
 
 [[package]]
 name = "micro_http"
@@ -608,9 +618,9 @@ dependencies = [
 
 [[package]]
 name = "openssl-sys"
-version = "0.9.65"
+version = "0.9.66"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7a7907e3bfa08bb85105209cdfcb6c63d109f8f6c1ed6ca318fff5c1853fbc1d"
+checksum = "1996d2d305e561b70d1ee0c53f1542833f4e1ac6ce9a6708b6ff2738ca67dc82"
 dependencies = [
  "autocfg",
  "cc",
@@ -861,6 +871,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "dead70b0b5e03e9c814bcb6b01e03e68f7c57a80aa48c72ec92152ab3e818d49"
 
 [[package]]
+name = "rustc_version"
+version = "0.2.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "138e3e0acb6c9fb258b19b67cb8abd63c00679d2851805ea151465464fe9030a"
+dependencies = [
+ "semver",
+]
+
+[[package]]
 name = "ryu"
 version = "1.0.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -873,12 +892,27 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d29ab0c6d3fc0ee92fe66e2d99f700eab17a8d57d1c1d3b748380fb20baa78cd"
 
 [[package]]
-name = "seccomp"
+name = "seccompiler"
 version = "0.1.0"
-source = "git+https://github.com/firecracker-microvm/firecracker?tag=v0.24.5#cd36c699f3cb3d531289aadee26c45c1306edcfc"
+source = "git+https://github.com/rust-vmm/seccompiler#da5788d52f1ae8886d8ed4624199b7e9fa64ac04"
 dependencies = [
  "libc",
 ]
+
+[[package]]
+name = "semver"
+version = "0.9.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1d7eb9ef2c18661902cc47e535f9bc51b78acd254da71d375c2f6720d9a40403"
+dependencies = [
+ "semver-parser",
+]
+
+[[package]]
+name = "semver-parser"
+version = "0.7.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "388a1df253eca08550bef6c72392cfe7c30914bf41df5269b68cbd6ff8f570a3"
 
 [[package]]
 name = "serde"
@@ -1058,6 +1092,9 @@ name = "uuid"
 version = "0.8.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "bc5cf98d8186244414c848017f0e2676b3fcb46807f6668a97dfe67359a3c4b7"
+dependencies = [
+ "getrandom",
+]
 
 [[package]]
 name = "vcpkg"
@@ -1134,6 +1171,20 @@ dependencies = [
  "thiserror",
  "vfio-bindings",
  "vm-memory 0.5.0",
+ "vmm-sys-util",
+]
+
+[[package]]
+name = "vhdx"
+version = "0.1.0"
+dependencies = [
+ "byteorder",
+ "crc32c",
+ "libc",
+ "log",
+ "remain",
+ "thiserror",
+ "uuid",
  "vmm-sys-util",
 ]
 
@@ -1223,7 +1274,7 @@ dependencies = [
  "net_util",
  "pci",
  "rate_limiter",
- "seccomp",
+ "seccompiler",
  "serde",
  "serde_derive",
  "serde_json",
@@ -1337,7 +1388,7 @@ dependencies = [
  "option_parser",
  "pci",
  "qcow",
- "seccomp",
+ "seccompiler",
  "serde",
  "serde_derive",
  "serde_json",
@@ -1347,6 +1398,7 @@ dependencies = [
  "versionize",
  "versionize_derive",
  "vfio-ioctls",
+ "vhdx",
  "virtio-devices",
  "vm-allocator",
  "vm-device",

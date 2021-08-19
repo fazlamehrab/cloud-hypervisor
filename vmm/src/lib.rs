@@ -20,14 +20,15 @@ use crate::api::{
     VmSendMigrationData, VmmPingResponse,
 };
 use crate::config::{
-    DeviceConfig, DiskConfig, FsConfig, NetConfig, PmemConfig, RestoreConfig, VmConfig, VsockConfig,
+    DeviceConfig, DiskConfig, FsConfig, NetConfig, PmemConfig, RestoreConfig, UserDeviceConfig,
+    VmConfig, VsockConfig,
 };
 use crate::migration::{get_vm_snapshot, recv_vm_snapshot};
 use crate::seccomp_filters::{get_seccomp_filter, Thread};
 use crate::vm::{Error as VmError, Vm, VmState};
 use anyhow::anyhow;
 use libc::EFD_NONBLOCK;
-use seccomp::{SeccompAction, SeccompFilter};
+use seccompiler::{apply_filter, SeccompAction};
 use serde::ser::{Serialize, SerializeStruct, Serializer};
 use std::fs::File;
 use std::io;
@@ -120,11 +121,11 @@ pub enum Error {
 
     /// Cannot create seccomp filter
     #[error("Error creating seccomp filter: {0}")]
-    CreateSeccompFilter(seccomp::SeccompError),
+    CreateSeccompFilter(seccompiler::Error),
 
     /// Cannot apply seccomp filter
     #[error("Error applying seccomp filter: {0}")]
-    ApplySeccompFilter(seccomp::Error),
+    ApplySeccompFilter(seccompiler::Error),
 
     /// Error activating virtio devices
     #[error("Error activating virtio devices: {0:?}")]
@@ -262,7 +263,9 @@ pub fn start_vmm_thread(
         .name("vmm".to_string())
         .spawn(move || {
             // Apply seccomp filter for VMM thread.
-            SeccompFilter::apply(vmm_seccomp_filter).map_err(Error::ApplySeccompFilter)?;
+            if !vmm_seccomp_filter.is_empty() {
+                apply_filter(&vmm_seccomp_filter).map_err(Error::ApplySeccompFilter)?;
+            }
 
             let mut vmm = Vmm::new(
                 vmm_version.to_string(),
@@ -645,6 +648,21 @@ impl Vmm {
         }
     }
 
+    fn vm_add_user_device(
+        &mut self,
+        device_cfg: UserDeviceConfig,
+    ) -> result::Result<Vec<u8>, VmError> {
+        if let Some(ref mut vm) = self.vm {
+            let info = vm.add_user_device(device_cfg).map_err(|e| {
+                error!("Error when adding new user device to the VM: {:?}", e);
+                e
+            })?;
+            serde_json::to_vec(&info).map_err(VmError::SerializeJson)
+        } else {
+            Err(VmError::VmNotRunning)
+        }
+    }
+
     fn vm_remove_device(&mut self, id: String) -> result::Result<(), VmError> {
         if let Some(ref mut vm) = self.vm {
             if let Err(e) = vm.remove_device(id) {
@@ -990,6 +1008,151 @@ impl Vmm {
         Ok(true)
     }
 
+    fn send_migration(
+        vm: &mut Vm,
+        #[cfg(all(feature = "kvm", target_arch = "x86_64"))] hypervisor: Arc<
+            dyn hypervisor::Hypervisor,
+        >,
+        send_data_migration: VmSendMigrationData,
+    ) -> result::Result<(), MigratableError> {
+        let path = Self::socket_url_to_path(&send_data_migration.destination_url)?;
+        let mut socket = UnixStream::connect(&path).map_err(|e| {
+            MigratableError::MigrateSend(anyhow!("Error connecting to UNIX socket: {}", e))
+        })?;
+
+        // Start the migration
+        Request::start().write_to(&mut socket)?;
+        let res = Response::read_from(&mut socket)?;
+        if res.status() != Status::Ok {
+            warn!("Error starting migration");
+            Request::abandon().write_to(&mut socket)?;
+            Response::read_from(&mut socket).ok();
+            return Err(MigratableError::MigrateSend(anyhow!(
+                "Error starting migration"
+            )));
+        }
+
+        // Send config
+        let vm_config = vm.get_config();
+        #[cfg(all(feature = "kvm", target_arch = "x86_64"))]
+        let common_cpuid = {
+            #[cfg(feature = "tdx")]
+            let tdx_enabled = vm_config.lock().unwrap().tdx.is_some();
+            let phys_bits = vm::physical_bits(
+                vm_config.lock().unwrap().cpus.max_phys_bits,
+                #[cfg(feature = "tdx")]
+                tdx_enabled,
+            );
+            arch::generate_common_cpuid(
+                hypervisor,
+                None,
+                None,
+                phys_bits,
+                vm_config.lock().unwrap().cpus.kvm_hyperv,
+                #[cfg(feature = "tdx")]
+                tdx_enabled,
+            )
+            .map_err(|e| {
+                MigratableError::MigrateReceive(anyhow!("Error generating common cpuid': {:?}", e))
+            })?
+        };
+
+        let vm_migration_config = VmMigrationConfig {
+            vm_config,
+            #[cfg(all(feature = "kvm", target_arch = "x86_64"))]
+            common_cpuid,
+        };
+
+        let config_data = serde_json::to_vec(&vm_migration_config).unwrap();
+        Request::config(config_data.len() as u64).write_to(&mut socket)?;
+        socket
+            .write_all(&config_data)
+            .map_err(MigratableError::MigrateSocket)?;
+        let res = Response::read_from(&mut socket)?;
+        if res.status() != Status::Ok {
+            warn!("Error during config migration");
+            Request::abandon().write_to(&mut socket)?;
+            Response::read_from(&mut socket).ok();
+            return Err(MigratableError::MigrateSend(anyhow!(
+                "Error during config migration"
+            )));
+        }
+
+        // Start logging dirty pages
+        vm.start_dirty_log()?;
+
+        // Send memory table
+        let table = vm.memory_range_table()?;
+        Request::memory(table.length())
+            .write_to(&mut socket)
+            .unwrap();
+        table.write_to(&mut socket)?;
+        // And then the memory itself
+        vm.send_memory_regions(&table, &mut socket)?;
+        let res = Response::read_from(&mut socket)?;
+        if res.status() != Status::Ok {
+            warn!("Error during memory migration");
+            Request::abandon().write_to(&mut socket)?;
+            Response::read_from(&mut socket).ok();
+            return Err(MigratableError::MigrateSend(anyhow!(
+                "Error during memory migration"
+            )));
+        }
+
+        // Try at most 5 passes of dirty memory sending
+        const MAX_DIRTY_MIGRATIONS: usize = 5;
+        for i in 0..MAX_DIRTY_MIGRATIONS {
+            info!("Dirty memory migration {} of {}", i, MAX_DIRTY_MIGRATIONS);
+            if !Self::vm_maybe_send_dirty_pages(vm, &mut socket)? {
+                break;
+            }
+        }
+
+        // Now pause VM
+        vm.pause()?;
+
+        // Send last batch of dirty pages
+        Self::vm_maybe_send_dirty_pages(vm, &mut socket)?;
+
+        // Capture snapshot and send it
+        let vm_snapshot = vm.snapshot()?;
+        let snapshot_data = serde_json::to_vec(&vm_snapshot).unwrap();
+        Request::state(snapshot_data.len() as u64).write_to(&mut socket)?;
+        socket
+            .write_all(&snapshot_data)
+            .map_err(MigratableError::MigrateSocket)?;
+        let res = Response::read_from(&mut socket)?;
+        if res.status() != Status::Ok {
+            warn!("Error during state migration");
+            Request::abandon().write_to(&mut socket)?;
+            Response::read_from(&mut socket).ok();
+            return Err(MigratableError::MigrateSend(anyhow!(
+                "Error during state migration"
+            )));
+        }
+
+        // Complete the migration
+        Request::complete().write_to(&mut socket)?;
+        let res = Response::read_from(&mut socket)?;
+        if res.status() != Status::Ok {
+            warn!("Error completing migration");
+            Request::abandon().write_to(&mut socket)?;
+            Response::read_from(&mut socket).ok();
+            return Err(MigratableError::MigrateSend(anyhow!(
+                "Error completing migration"
+            )));
+        }
+        info!("Migration complete");
+
+        // Let every Migratable object know about the migration being complete
+        vm.complete_migration()?;
+
+        // Stop logging dirty pages
+        vm.stop_dirty_log()?;
+
+        Ok(())
+    }
+
     fn vm_send_migration(
         &mut self,
         send_data_migration: VmSendMigrationData,
@@ -998,162 +1161,37 @@ impl Vmm {
             "Sending migration: destination_url = {}",
             send_data_migration.destination_url
         );
-        if let Some(ref mut vm) = self.vm {
-            match {
-                let path = Self::socket_url_to_path(&send_data_migration.destination_url)?;
-                let mut socket = UnixStream::connect(&path).map_err(|e| {
-                    MigratableError::MigrateSend(anyhow!("Error connecting to UNIX socket: {}", e))
-                })?;
-
-                // Start the migration
-                Request::start().write_to(&mut socket)?;
-                let res = Response::read_from(&mut socket)?;
-                if res.status() != Status::Ok {
-                    warn!("Error starting migration");
-                    Request::abandon().write_to(&mut socket)?;
-                    Response::read_from(&mut socket).ok();
-                    return Err(MigratableError::MigrateSend(anyhow!(
-                        "Error starting migration"
-                    )));
-                }
-
-                // Send config
-                let vm_config = vm.get_config();
+        if let Some(vm) = self.vm.as_mut() {
+            Self::send_migration(
+                vm,
                 #[cfg(all(feature = "kvm", target_arch = "x86_64"))]
-                let common_cpuid = {
-                    #[cfg(feature = "tdx")]
-                    let tdx_enabled = vm_config.lock().unwrap().tdx.is_some();
-                    let phys_bits = vm::physical_bits(
-                        vm_config.lock().unwrap().cpus.max_phys_bits,
-                        #[cfg(feature = "tdx")]
-                        tdx_enabled,
-                    );
-                    arch::generate_common_cpuid(
-                        self.hypervisor.clone(),
-                        None,
-                        None,
-                        phys_bits,
-                        vm_config.lock().unwrap().cpus.kvm_hyperv,
-                        #[cfg(feature = "tdx")]
-                        tdx_enabled,
-                    )
-                    .map_err(|e| {
-                        MigratableError::MigrateReceive(anyhow!(
-                            "Error generating common cpuid': {:?}",
-                            e
-                        ))
-                    })?
-                };
+                self.hypervisor.clone(),
+                send_data_migration,
+            )
+            .map_err(|migration_err| {
+                error!("Migration failed: {:?}", migration_err);
 
-                let vm_migration_config = VmMigrationConfig {
-                    vm_config,
-                    #[cfg(all(feature = "kvm", target_arch = "x86_64"))]
-                    common_cpuid,
-                };
-
-                let config_data = serde_json::to_vec(&vm_migration_config).unwrap();
-                Request::config(config_data.len() as u64).write_to(&mut socket)?;
-                socket
-                    .write_all(&config_data)
-                    .map_err(MigratableError::MigrateSocket)?;
-                let res = Response::read_from(&mut socket)?;
-                if res.status() != Status::Ok {
-                    warn!("Error during config migration");
-                    Request::abandon().write_to(&mut socket)?;
-                    Response::read_from(&mut socket).ok();
-                    return Err(MigratableError::MigrateSend(anyhow!(
-                        "Error during config migration"
-                    )));
+                // Stop logging dirty pages
+                if let Err(e) = vm.stop_dirty_log() {
+                    return e;
                 }
 
-                // Start logging dirty pages
-                vm.start_dirty_log()?;
-
-                // Send memory table
-                let table = vm.memory_range_table()?;
-                Request::memory(table.length())
-                    .write_to(&mut socket)
-                    .unwrap();
-                table.write_to(&mut socket)?;
-                // And then the memory itself
-                vm.send_memory_regions(&table, &mut socket)?;
-                let res = Response::read_from(&mut socket)?;
-                if res.status() != Status::Ok {
-                    warn!("Error during memory migration");
-                    Request::abandon().write_to(&mut socket)?;
-                    Response::read_from(&mut socket).ok();
-                    return Err(MigratableError::MigrateSend(anyhow!(
-                        "Error during memory migration"
-                    )));
-                }
-
-                // Try at most 5 passes of dirty memory sending
-                const MAX_DIRTY_MIGRATIONS: usize = 5;
-                for i in 0..MAX_DIRTY_MIGRATIONS {
-                    info!("Dirty memory migration {} of {}", i, MAX_DIRTY_MIGRATIONS);
-                    if !Self::vm_maybe_send_dirty_pages(vm, &mut socket)? {
-                        break;
+                if vm.get_state().unwrap() == VmState::Paused {
+                    if let Err(e) = vm.resume() {
+                        return e;
                     }
                 }
 
-                // Now pause VM
-                vm.pause()?;
+                migration_err
+            })?;
 
-                // Send last batch of dirty pages
-                Self::vm_maybe_send_dirty_pages(vm, &mut socket)?;
-
-                // Capture snapshot and send it
-                let vm_snapshot = vm.snapshot()?;
-                let snapshot_data = serde_json::to_vec(&vm_snapshot).unwrap();
-                Request::state(snapshot_data.len() as u64).write_to(&mut socket)?;
-                socket
-                    .write_all(&snapshot_data)
-                    .map_err(MigratableError::MigrateSocket)?;
-                let res = Response::read_from(&mut socket)?;
-                if res.status() != Status::Ok {
-                    warn!("Error during state migration");
-                    Request::abandon().write_to(&mut socket)?;
-                    Response::read_from(&mut socket).ok();
-                    return Err(MigratableError::MigrateSend(anyhow!(
-                        "Error during state migration"
-                    )));
-                }
-
-                // Complete the migration
-                Request::complete().write_to(&mut socket)?;
-                let res = Response::read_from(&mut socket)?;
-                if res.status() != Status::Ok {
-                    warn!("Error completing migration");
-                    Request::abandon().write_to(&mut socket)?;
-                    Response::read_from(&mut socket).ok();
-                    return Err(MigratableError::MigrateSend(anyhow!(
-                        "Error completing migration"
-                    )));
-                }
-                info!("Migration complete");
-                Ok(())
-            } {
-                // Stop logging dirty pages and keep the source VM paused unpon successful migration
-                Ok(()) => {
-                    // Stop logging dirty pages
-                    vm.stop_dirty_log()?;
-
-                    Ok(())
-                }
-                // Ensure the source VM continue to run upon unsuccessful migration
-                Err(e) => {
-                    error!("Migration failed: {:?}", e);
-
-                    // Stop logging dirty pages
-                    vm.stop_dirty_log()?;
-
-                    if vm.get_state().unwrap() == VmState::Paused {
-                        vm.resume()?;
-                    }
-
+            // Shutdown the VM after the migration succeeded
+            self.exit_evt.write(1).map_err(|e| {
+                MigratableError::MigrateSend(anyhow!(
+                    "Failed shutting down the VM after migration: {:?}",
                     e
-                }
-            }
+                ))
+            })
         } else {
             Err(MigratableError::MigrateSend(anyhow!("VM is not running")))
         }
@@ -1391,6 +1429,13 @@ impl Vmm {
                                     let response = self
                                         .vm_add_device(add_device_data.as_ref().clone())
                                         .map_err(ApiError::VmAddDevice)
+                                        .map(ApiResponsePayload::VmAction);
+                                    sender.send(response).map_err(Error::ApiResponseSend)?;
+                                }
+                                ApiRequest::VmAddUserDevice(add_device_data, sender) => {
+                                    let response = self
+                                        .vm_add_user_device(add_device_data.as_ref().clone())
+                                        .map_err(ApiError::VmAddUserDevice)
                                         .map(ApiResponsePayload::VmAction);
                                     sender.send(response).map_err(Error::ApiResponseSend)?;
                                 }

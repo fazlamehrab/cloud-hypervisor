@@ -13,7 +13,7 @@ homepage = "https://github.com/cloud-hypervisor/cloud-hypervisor"
 lto = true
 
 [dependencies]
-anyhow = "1.0.42"
+anyhow = "1.0.43"
 api_client = { path = "api_client" }
 clap = { version = "2.33.3", features = ["wrap_help"] }
 epoll = "4.3.1"
@@ -22,7 +22,7 @@ hypervisor = { path = "hypervisor" }
 libc = "0.2.99"
 log = { version = "0.4.14", features = ["std"] }
 option_parser = { path = "option_parser" }
-seccomp = { git = "https://github.com/firecracker-microvm/firecracker", tag = "v0.24.5" }
+seccompiler = { git = "https://github.com/rust-vmm/seccompiler"}
 serde_json = "1.0.66"
 signal-hook = "0.3.9"
 thiserror = "1.0.26"
@@ -78,6 +78,7 @@ members = [
     "qcow",
     "rate_limiter",
     "vfio_user",
+    "vhdx",
     "vhost_user_backend",
     "vhost_user_block",
     "vhost_user_net",

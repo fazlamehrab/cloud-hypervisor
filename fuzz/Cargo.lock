@@ -20,9 +20,9 @@ dependencies = [
 
 [[package]]
 name = "anyhow"
-version = "1.0.42"
+version = "1.0.43"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "595d3cfa7a60d4555cb5067b99f07142a08ea778de5cf993f7b75c7d8fabc486"
+checksum = "28ae2b3dec75a406790005a200b1bd89785afc02517a00ca99ecfe093ee9e6cf"
 
 [[package]]
 name = "api_client"
@@ -87,9 +87,9 @@ dependencies = [
 
 [[package]]
 name = "bitflags"
-version = "1.2.1"
+version = "1.3.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cf1de2fe8c75bc145a2f577add951f8134889b4795d47466a54a5c846d691693"
+checksum = "bef38d45163c2f1dde094a7dfd33ccf595c92905c8f8f4fdc18d06fb1037718a"
 
 [[package]]
 name = "block_util"
@@ -102,6 +102,7 @@ dependencies = [
  "thiserror",
  "versionize",
  "versionize_derive",
+ "vhdx",
  "virtio-bindings",
  "vm-memory 0.6.0",
  "vm-virtio",
@@ -155,7 +156,7 @@ dependencies = [
  "libc",
  "log",
  "option_parser",
- "seccomp",
+ "seccompiler",
  "serde_json",
  "signal-hook",
  "thiserror",
@@ -173,11 +174,21 @@ dependencies = [
  "libc",
  "libfuzzer-sys",
  "qcow",
- "seccomp",
+ "seccompiler",
+ "vhdx",
  "virtio-devices",
  "vm-memory 0.6.0",
  "vm-virtio",
  "vmm-sys-util",
+]
+
+[[package]]
+name = "crc32c"
+version = "0.6.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "210cdf933e6a81212bfabf90cd8762f471b5922e5f6b709547673ad8e04b9448"
+dependencies = [
+ "rustc_version",
 ]
 
 [[package]]
@@ -231,6 +242,17 @@ name = "fdt"
 version = "0.1.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b643857cf70949306b81d7e92cb9d47add673868edac9863c4a49c42feaf3f1e"
+
+[[package]]
+name = "getrandom"
+version = "0.2.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7fcd999463524c52659517fe2cea98493cfe485d10565e7b0fb07dbba7ad2753"
+dependencies = [
+ "cfg-if",
+ "libc",
+ "wasi",
+]
 
 [[package]]
 name = "hermit-abi"
@@ -315,9 +337,9 @@ checksum = "e2abad23fbc42b3700f2f279844dc832adb2b2eb069b2df918f455c4e18cc646"
 
 [[package]]
 name = "libc"
-version = "0.2.98"
+version = "0.2.99"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "320cfe77175da3a483efed4bc0adc1968ca050b098ce4f2f1c13a56626128790"
+checksum = "a7f823d141fe0a24df1e23b4af4e3c7ba9e5966ec514ea068c93024aa7deb765"
 
 [[package]]
 name = "libfuzzer-sys"
@@ -406,6 +428,7 @@ dependencies = [
  "versionize_derive",
  "vfio-bindings",
  "vfio-ioctls",
+ "vfio_user",
  "vm-allocator",
  "vm-device",
  "vm-memory 0.6.0",
@@ -463,18 +486,42 @@ dependencies = [
 ]
 
 [[package]]
+name = "rustc_version"
+version = "0.2.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "138e3e0acb6c9fb258b19b67cb8abd63c00679d2851805ea151465464fe9030a"
+dependencies = [
+ "semver",
+]
+
+[[package]]
 name = "ryu"
 version = "1.0.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "71d301d4193d031abdd79ff7e3dd721168a9572ef3fe51a1517aba235bd8f86e"
 
 [[package]]
-name = "seccomp"
+name = "seccompiler"
 version = "0.1.0"
-source = "git+https://github.com/firecracker-microvm/firecracker?tag=v0.24.5#cd36c699f3cb3d531289aadee26c45c1306edcfc"
+source = "git+https://github.com/rust-vmm/seccompiler#da5788d52f1ae8886d8ed4624199b7e9fa64ac04"
 dependencies = [
  "libc",
 ]
+
+[[package]]
+name = "semver"
+version = "0.9.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1d7eb9ef2c18661902cc47e535f9bc51b78acd254da71d375c2f6720d9a40403"
+dependencies = [
+ "semver-parser",
+]
+
+[[package]]
+name = "semver-parser"
+version = "0.7.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "388a1df253eca08550bef6c72392cfe7c30914bf41df5269b68cbd6ff8f570a3"
 
 [[package]]
 name = "serde"
@@ -603,6 +650,9 @@ name = "uuid"
 version = "0.8.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "bc5cf98d8186244414c848017f0e2676b3fcb46807f6668a97dfe67359a3c4b7"
+dependencies = [
+ "getrandom",
+]
 
 [[package]]
 name = "vec_map"
@@ -661,9 +711,40 @@ dependencies = [
 ]
 
 [[package]]
+name = "vfio_user"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "libc",
+ "log",
+ "serde",
+ "serde_derive",
+ "serde_json",
+ "thiserror",
+ "vfio-bindings",
+ "vm-memory 0.5.0",
+ "vmm-sys-util",
+]
+
+[[package]]
+name = "vhdx"
+version = "0.1.0"
+dependencies = [
+ "byteorder",
+ "crc32c",
+ "libc",
+ "log",
+ "remain",
+ "thiserror",
+ "uuid",
+ "vmm-sys-util",
+]
+
+[[package]]
 name = "vhost"
 version = "0.1.0"
-source = "git+https://github.com/rust-vmm/vhost?branch=master#14d754c5c77f06d5af8fc48b2634debd5fbd9a18"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8a6b90237e10f1a61b35fba73885c3567e1a5a8c40d44daae335f7710210a7dc"
 dependencies = [
  "bitflags",
  "libc",
@@ -694,7 +775,7 @@ dependencies = [
  "net_util",
  "pci",
  "rate_limiter",
- "seccomp",
+ "seccompiler",
  "serde",
  "serde_derive",
  "serde_json",
@@ -743,6 +824,7 @@ name = "vm-memory"
 version = "0.5.0"
 source = "git+https://github.com/rust-vmm/vm-memory?rev=5bd7138758183a73ac0da27ce40c004d95f1a7e9#5bd7138758183a73ac0da27ce40c004d95f1a7e9"
 dependencies = [
+ "arc-swap",
  "libc",
  "winapi",
 ]
@@ -805,7 +887,7 @@ dependencies = [
  "option_parser",
  "pci",
  "qcow",
- "seccomp",
+ "seccompiler",
  "serde",
  "serde_derive",
  "serde_json",
@@ -815,6 +897,7 @@ dependencies = [
  "versionize",
  "versionize_derive",
  "vfio-ioctls",
+ "vhdx",
  "virtio-devices",
  "vm-allocator",
  "vm-device",
@@ -835,6 +918,12 @@ dependencies = [
  "serde",
  "serde_derive",
 ]
+
+[[package]]
+name = "wasi"
+version = "0.10.2+wasi-snapshot-preview1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fd6fbd9a79829dd1ad0cc20627bf1ed606756a7f77edff7b66b7064f9cb327c6"
 
 [[package]]
 name = "winapi"

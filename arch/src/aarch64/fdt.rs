@@ -6,6 +6,7 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the THIRD-PARTY file.
 
+use crate::NumaNodes;
 use byteorder::{BigEndian, ByteOrder};
 use std::cmp;
 use std::collections::HashMap;
@@ -24,7 +25,7 @@ use super::layout::{
     PCI_HIGH_BASE, PCI_MMCONFIG_SIZE, PCI_MMCONFIG_START,
 };
 use vm_fdt::{FdtWriter, FdtWriterResult};
-use vm_memory::{Address, Bytes, GuestAddress, GuestMemory, GuestMemoryError};
+use vm_memory::{Address, Bytes, GuestAddress, GuestMemory, GuestMemoryError, GuestMemoryRegion};
 
 // This is a value for uniquely identifying the FDT node declaring the interrupt controller.
 const GIC_PHANDLE: u32 = 1;
@@ -85,6 +86,7 @@ pub fn create_fdt<T: DeviceInfoForFdt + Clone + Debug, S: ::std::hash::BuildHash
     gic_device: &dyn GicDevice,
     initrd: &Option<InitramfsConfig>,
     pci_space_address: &(u64, u64),
+    numa_nodes: &NumaNodes,
 ) -> FdtWriterResult<Vec<u8>> {
     // Allocate stuff necessary for the holding the blob.
     let mut fdt = FdtWriter::new().unwrap();
@@ -103,8 +105,8 @@ pub fn create_fdt<T: DeviceInfoForFdt + Clone + Debug, S: ::std::hash::BuildHash
     // This is not mandatory but we use it to point the root node to the node
     // containing description of the interrupt controller for this VM.
     fdt.property_u32("interrupt-parent", GIC_PHANDLE)?;
-    create_cpu_nodes(&mut fdt, &vcpu_mpidr, vcpu_topology)?;
-    create_memory_node(&mut fdt, guest_mem)?;
+    create_cpu_nodes(&mut fdt, &vcpu_mpidr, vcpu_topology, numa_nodes)?;
+    create_memory_node(&mut fdt, guest_mem, numa_nodes)?;
     create_chosen_node(&mut fdt, cmdline.to_str().unwrap(), initrd)?;
     create_gic_node(&mut fdt, gic_device)?;
     create_timer_node(&mut fdt)?;
@@ -112,6 +114,9 @@ pub fn create_fdt<T: DeviceInfoForFdt + Clone + Debug, S: ::std::hash::BuildHash
     create_psci_node(&mut fdt)?;
     create_devices_node(&mut fdt, device_info)?;
     create_pci_nodes(&mut fdt, pci_space_address.0, pci_space_address.1)?;
+    if numa_nodes.len() > 1 {
+        create_distance_map_node(&mut fdt, numa_nodes)?;
+    }
 
     // End Header node.
     fdt.end_node(root_node)?;
@@ -135,6 +140,7 @@ fn create_cpu_nodes(
     fdt: &mut FdtWriter,
     vcpu_mpidr: &[u64],
     vcpu_topology: Option<(u8, u8, u8)>,
+    numa_nodes: &NumaNodes,
 ) -> FdtWriterResult<()> {
     // See https://github.com/torvalds/linux/blob/master/Documentation/devicetree/bindings/arm/cpus.yaml.
     let cpus_node = fdt.begin_node("cpus")?;
@@ -159,6 +165,17 @@ fn create_cpu_nodes(
         // See http://infocenter.arm.com/help/index.jsp?topic=/com.arm.doc.ddi0488c/BABHBJCI.html.
         fdt.property_u32("reg", (mpidr & 0x7FFFFF) as u32)?;
         fdt.property_u32("phandle", cpu_id as u32 + FIRST_VCPU_PHANDLE)?;
+
+        // Add `numa-node-id` property if there is any numa config.
+        if numa_nodes.len() > 1 {
+            for numa_node_idx in 0..numa_nodes.len() {
+                let numa_node = numa_nodes.get(&(numa_node_idx as u32));
+                if numa_node.unwrap().cpus.contains(&(cpu_id as u8)) {
+                    fdt.property_u32("numa-node-id", numa_node_idx as u32)?;
+                }
+            }
+        }
+
         fdt.end_node(cpu_node)?;
     }
 
@@ -230,16 +247,46 @@ fn create_cpu_nodes(
     Ok(())
 }
 
-fn create_memory_node(fdt: &mut FdtWriter, guest_mem: &GuestMemoryMmap) -> FdtWriterResult<()> {
-    let mem_size = guest_mem.last_addr().raw_value() - super::layout::RAM_64BIT_START + 1;
-    // See https://github.com/torvalds/linux/blob/master/Documentation/devicetree/booting-without-of.txt#L960
-    // for an explanation of this.
-    let mem_reg_prop = [super::layout::RAM_64BIT_START as u64, mem_size as u64];
+fn create_memory_node(
+    fdt: &mut FdtWriter,
+    guest_mem: &GuestMemoryMmap,
+    numa_nodes: &NumaNodes,
+) -> FdtWriterResult<()> {
+    if numa_nodes.len() > 1 {
+        for numa_node_idx in 0..numa_nodes.len() {
+            let numa_node = numa_nodes.get(&(numa_node_idx as u32));
+            // Each memory zone of numa will have its own memory node, but
+            // different numa nodes should not share same memory zones.
+            for memory_region in numa_node.unwrap().memory_regions.iter() {
+                let memory_region_start_addr: u64 = memory_region.start_addr().raw_value();
+                let memory_region_size: u64 = memory_region.size() as u64;
+                let mem_reg_prop = [memory_region_start_addr, memory_region_size];
+                // With feature `acpi` enabled, RAM at 0-4M is for edk2 only
+                // and should be hidden to the guest.
+                #[cfg(feature = "acpi")]
+                if memory_region_start_addr == 0 {
+                    continue;
+                }
 
-    let memory_node = fdt.begin_node("memory")?;
-    fdt.property_string("device_type", "memory")?;
-    fdt.property_array_u64("reg", &mem_reg_prop)?;
-    fdt.end_node(memory_node)?;
+                let memory_node_name = format!("memory@{:x}", memory_region_start_addr);
+                let memory_node = fdt.begin_node(&memory_node_name)?;
+                fdt.property_string("device_type", "memory")?;
+                fdt.property_array_u64("reg", &mem_reg_prop)?;
+                fdt.property_u32("numa-node-id", numa_node_idx as u32)?;
+                fdt.end_node(memory_node)?;
+            }
+        }
+    } else {
+        let mem_size = guest_mem.last_addr().raw_value() - super::layout::RAM_64BIT_START + 1;
+        // See https://github.com/torvalds/linux/blob/master/Documentation/devicetree/booting-without-of.txt#L960
+        // for an explanation of this.
+        let mem_reg_prop = [super::layout::RAM_64BIT_START as u64, mem_size as u64];
+        let memory_node = fdt.begin_node("memory")?;
+
+        fdt.property_string("device_type", "memory")?;
+        fdt.property_array_u64("reg", &mem_reg_prop)?;
+        fdt.end_node(memory_node)?;
+    }
 
     Ok(())
 }
@@ -557,6 +604,47 @@ fn create_pci_nodes(
     fdt.property_null("dma-coherent")?;
     fdt.property_u32("msi-parent", MSI_PHANDLE)?;
     fdt.end_node(pci_node)?;
+
+    Ok(())
+}
+
+fn create_distance_map_node(fdt: &mut FdtWriter, numa_nodes: &NumaNodes) -> FdtWriterResult<()> {
+    let distance_map_node = fdt.begin_node("distance-map")?;
+    fdt.property_string("compatible", "numa-distance-map-v1")?;
+    // Construct the distance matrix.
+    // 1. We use the word entry to describe a distance from a node to
+    // its destination, e.g. 0 -> 1 = 20 is described as <0 1 20>.
+    // 2. Each entry represents distance from first node to second node.
+    // The distances are equal in either direction.
+    // 3. The distance from a node to self (local distance) is represented
+    // with value 10 and all internode distance should be represented with
+    // a value greater than 10.
+    // 4. distance-matrix should have entries in lexicographical ascending
+    // order of nodes.
+    let mut distance_matrix = Vec::new();
+    for numa_node_idx in 0..numa_nodes.len() {
+        let numa_node = numa_nodes.get(&(numa_node_idx as u32));
+        for dest_numa_node in 0..numa_node.unwrap().distances.len() + 1 {
+            if numa_node_idx == dest_numa_node {
+                distance_matrix.push(numa_node_idx as u32);
+                distance_matrix.push(dest_numa_node as u32);
+                distance_matrix.push(10_u32);
+                continue;
+            }
+
+            distance_matrix.push(numa_node_idx as u32);
+            distance_matrix.push(dest_numa_node as u32);
+            distance_matrix.push(
+                *numa_node
+                    .unwrap()
+                    .distances
+                    .get(&(dest_numa_node as u32))
+                    .unwrap() as u32,
+            );
+        }
+    }
+    fdt.property_array_u32("distance-matrix", distance_matrix.as_ref())?;
+    fdt.end_node(distance_map_node)?;
 
     Ok(())
 }

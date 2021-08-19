@@ -49,13 +49,16 @@ pub enum MigratableError {
     MigrateSocket(#[source] std::io::Error),
 
     #[error("Failed to start migration for migratable component: {0}")]
-    MigrateStart(#[source] anyhow::Error),
+    StartDirtyLog(#[source] anyhow::Error),
 
     #[error("Failed to stop migration for migratable component: {0}")]
-    MigrateStop(#[source] anyhow::Error),
+    StopDirtyLog(#[source] anyhow::Error),
 
     #[error("Failed to retrieve dirty ranges for migratable component: {0}")]
-    MigrateDirtyRanges(#[source] anyhow::Error),
+    DirtyLog(#[source] anyhow::Error),
+
+    #[error("Failed to complete migration for migratable component: {0}")]
+    CompleteMigration(#[source] anyhow::Error),
 }
 
 /// A Pausable component can be paused and resumed.
@@ -300,5 +303,9 @@ pub trait Migratable: Send + Pausable + Snapshottable + Transportable {
 
     fn dirty_log(&mut self) -> std::result::Result<MemoryRangeTable, MigratableError> {
         Ok(MemoryRangeTable::default())
+    }
+
+    fn complete_migration(&mut self) -> std::result::Result<(), MigratableError> {
+        Ok(())
     }
 }

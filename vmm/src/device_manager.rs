@@ -22,8 +22,6 @@ use crate::interrupt::LegacyUserspaceInterruptManager;
 #[cfg(feature = "acpi")]
 use crate::memory_manager::MEMORY_MANAGER_ACPI_SIZE;
 use crate::memory_manager::{Error as MemoryManagerError, MemoryManager};
-#[cfg(feature = "acpi")]
-use crate::vm::NumaNodes;
 use crate::GuestRegionMmap;
 use crate::PciDeviceInfo;
 use crate::{device_node, DEVICE_MANAGER_SNAPSHOT_ID};
@@ -34,12 +32,14 @@ use anyhow::anyhow;
 use arch::layout;
 #[cfg(target_arch = "x86_64")]
 use arch::layout::{APIC_START, IOAPIC_SIZE, IOAPIC_START};
+#[cfg(any(target_arch = "aarch64", feature = "acpi"))]
+use arch::NumaNodes;
 #[cfg(target_arch = "aarch64")]
 use arch::{DeviceType, MmioDeviceInfo};
 use block_util::{
     async_io::DiskFile, block_io_uring_is_supported, detect_image_type,
     fixed_vhd_async::FixedVhdDiskAsync, fixed_vhd_sync::FixedVhdDiskSync, qcow_sync::QcowDiskSync,
-    raw_async::RawFileDisk, raw_sync::RawFileDiskSync, ImageType,
+    raw_async::RawFileDisk, raw_sync::RawFileDiskSync, vhdx_sync::VhdxDiskSync, ImageType,
 };
 #[cfg(target_arch = "aarch64")]
 use devices::gic;
@@ -66,7 +66,7 @@ use pci::{
     DeviceRelocation, PciBarRegionType, PciBus, PciConfigIo, PciConfigMmio, PciDevice, PciRoot,
     VfioUserPciDevice, VfioUserPciDeviceError,
 };
-use seccomp::SeccompAction;
+use seccompiler::SeccompAction;
 use std::collections::HashMap;
 use std::convert::TryInto;
 use std::fs::{read_link, File, OpenOptions};
@@ -416,6 +416,12 @@ pub enum DeviceManagerError {
 
     /// Failed to create FixedVhdDiskSync
     CreateFixedVhdDiskSync(io::Error),
+
+    /// Failed to create QcowDiskSync
+    CreateQcowDiskSync(qcow::Error),
+
+    /// Failed to create FixedVhdxDiskSync
+    CreateFixedVhdxDiskSync(vhdx::vhdx::VhdxError),
 
     /// Failed adding DMA mapping handler to virtio-mem device.
     AddDmaMappingHandlerVirtioMem(virtio_devices::mem::Error),
@@ -919,7 +925,7 @@ pub struct DeviceManager {
     seccomp_action: SeccompAction,
 
     // List of guest NUMA nodes.
-    #[cfg(feature = "acpi")]
+    #[cfg(any(target_arch = "aarch64", feature = "acpi"))]
     numa_nodes: NumaNodes,
 
     // Possible handle to the virtio-balloon device
@@ -941,6 +947,9 @@ pub struct DeviceManager {
 
     // Flag to force setting the iommu on virtio devices
     force_iommu: bool,
+
+    // Helps identify if the VM is currently being restored
+    restoring: bool,
 }
 
 impl DeviceManager {
@@ -952,9 +961,10 @@ impl DeviceManager {
         _exit_evt: &EventFd,
         reset_evt: &EventFd,
         seccomp_action: SeccompAction,
-        #[cfg(feature = "acpi")] numa_nodes: NumaNodes,
+        #[cfg(any(target_arch = "aarch64", feature = "acpi"))] numa_nodes: NumaNodes,
         activate_evt: &EventFd,
         force_iommu: bool,
+        restoring: bool,
     ) -> DeviceManagerResult<Arc<Mutex<Self>>> {
         let device_tree = Arc::new(Mutex::new(DeviceTree::new()));
 
@@ -1014,7 +1024,7 @@ impl DeviceManager {
             #[cfg(target_arch = "aarch64")]
             id_to_dev_info: HashMap::new(),
             seccomp_action,
-            #[cfg(feature = "acpi")]
+            #[cfg(any(target_arch = "aarch64", feature = "acpi"))]
             numa_nodes,
             balloon: None,
             activate_evt: activate_evt
@@ -1028,6 +1038,7 @@ impl DeviceManager {
             #[cfg(target_arch = "aarch64")]
             gpio_device: None,
             force_iommu,
+            restoring,
         };
 
         let device_manager = Arc::new(Mutex::new(device_manager));
@@ -1859,7 +1870,7 @@ impl DeviceManager {
                 queue_size: disk_cfg.queue_size,
             };
             let vhost_user_block_device = Arc::new(Mutex::new(
-                match virtio_devices::vhost_user::Blk::new(id.clone(), vu_cfg) {
+                match virtio_devices::vhost_user::Blk::new(id.clone(), vu_cfg, self.restoring) {
                     Ok(vub_device) => vub_device,
                     Err(e) => {
                         return Err(DeviceManagerError::CreateVhostUserBlk(e));
@@ -1931,7 +1942,17 @@ impl DeviceManager {
                 }
                 ImageType::Qcow2 => {
                     info!("Using synchronous QCOW disk file");
-                    Box::new(QcowDiskSync::new(file, disk_cfg.direct)) as Box<dyn DiskFile>
+                    Box::new(
+                        QcowDiskSync::new(file, disk_cfg.direct)
+                            .map_err(DeviceManagerError::CreateQcowDiskSync)?,
+                    ) as Box<dyn DiskFile>
+                }
+                ImageType::Vhdx => {
+                    info!("Using synchronous VHDX disk file");
+                    Box::new(
+                        VhdxDiskSync::new(file)
+                            .map_err(DeviceManagerError::CreateFixedVhdxDiskSync)?,
+                    ) as Box<dyn DiskFile>
                 }
             };
 
@@ -2016,6 +2037,7 @@ impl DeviceManager {
                     vu_cfg,
                     server,
                     self.seccomp_action.clone(),
+                    self.restoring,
                 ) {
                     Ok(vun_device) => vun_device,
                     Err(e) => {
@@ -2283,6 +2305,7 @@ impl DeviceManager {
                     fs_cfg.queue_size,
                     cache,
                     self.seccomp_action.clone(),
+                    self.restoring,
                 )
                 .map_err(DeviceManagerError::CreateVirtioFs)?,
             ));
@@ -2575,9 +2598,10 @@ impl DeviceManager {
             if let Some(virtio_mem_zone) = memory_zone.virtio_mem_zone() {
                 let id = self.next_device_name(MEM_DEVICE_NAME_PREFIX)?;
                 info!("Creating virtio-mem device: id = {}", id);
-                #[cfg(not(feature = "acpi"))]
+
+                #[cfg(all(target_arch = "x86_64", not(feature = "acpi")))]
                 let node_id: Option<u16> = None;
-                #[cfg(feature = "acpi")]
+                #[cfg(any(target_arch = "aarch64", feature = "acpi"))]
                 let node_id = numa_node_id_from_memory_zone_id(&self.numa_nodes, _memory_zone_id)
                     .map(|i| i as u16);
 
@@ -3303,6 +3327,28 @@ impl DeviceManager {
         })
     }
 
+    pub fn add_user_device(
+        &mut self,
+        device_cfg: &mut UserDeviceConfig,
+    ) -> DeviceManagerResult<PciDeviceInfo> {
+        let pci = if let Some(pci_bus) = &self.pci_bus {
+            Arc::clone(pci_bus)
+        } else {
+            return Err(DeviceManagerError::NoPciBus);
+        };
+
+        let (device_id, device_name) =
+            self.add_vfio_user_device(&mut pci.lock().unwrap(), device_cfg)?;
+
+        // Update the PCIU bitmap
+        self.pci_devices_up |= 1 << (device_id >> 3);
+
+        Ok(PciDeviceInfo {
+            id: device_name,
+            bdf: device_id,
+        })
+    }
+
     pub fn remove_device(&mut self, id: String) -> DeviceManagerResult<()> {
         // The node can be directly a PCI node in case the 'id' refers to a
         // VFIO device or a virtio-pci one.
@@ -3637,6 +3683,10 @@ impl DeviceManager {
             }
         }
 
+        // The devices have been fully restored, we can now update the
+        // restoring state of the DeviceManager.
+        self.restoring = false;
+
         Ok(())
     }
 
@@ -3668,13 +3718,10 @@ impl DeviceManager {
     }
 }
 
-#[cfg(feature = "acpi")]
+#[cfg(any(target_arch = "aarch64", feature = "acpi"))]
 fn numa_node_id_from_memory_zone_id(numa_nodes: &NumaNodes, memory_zone_id: &str) -> Option<u32> {
     for (numa_node_id, numa_node) in numa_nodes.iter() {
-        if numa_node
-            .memory_zones()
-            .contains(&memory_zone_id.to_owned())
-        {
+        if numa_node.memory_zones.contains(&memory_zone_id.to_owned()) {
             return Some(*numa_node_id);
         }
     }
@@ -4178,6 +4225,15 @@ impl Migratable for DeviceManager {
             }
         }
         Ok(MemoryRangeTable::new_from_tables(tables))
+    }
+
+    fn complete_migration(&mut self) -> std::result::Result<(), MigratableError> {
+        for (_, device_node) in self.device_tree.lock().unwrap().iter() {
+            if let Some(migratable) = &device_node.migratable {
+                migratable.lock().unwrap().complete_migration()?;
+            }
+        }
+        Ok(())
     }
 }
 

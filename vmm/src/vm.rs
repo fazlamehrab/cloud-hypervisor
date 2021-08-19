@@ -11,11 +11,11 @@
 // SPDX-License-Identifier: Apache-2.0 AND BSD-3-Clause
 //
 
-#[cfg(feature = "acpi")]
+#[cfg(any(target_arch = "aarch64", feature = "acpi"))]
 use crate::config::NumaConfig;
 use crate::config::{
-    DeviceConfig, DiskConfig, FsConfig, HotplugMethod, NetConfig, PmemConfig, ValidationError,
-    VmConfig, VsockConfig,
+    DeviceConfig, DiskConfig, FsConfig, HotplugMethod, NetConfig, PmemConfig, UserDeviceConfig,
+    ValidationError, VmConfig, VsockConfig,
 };
 use crate::cpu;
 use crate::device_manager::{
@@ -25,7 +25,7 @@ use crate::device_tree::DeviceTree;
 use crate::memory_manager::{Error as MemoryManagerError, MemoryManager};
 use crate::migration::{get_vm_snapshot, url_to_path, VM_SNAPSHOT_FILE};
 use crate::seccomp_filters::{get_seccomp_filter, Thread};
-use crate::{GuestMemoryMmap, GuestRegionMmap};
+use crate::GuestMemoryMmap;
 use crate::{
     PciDeviceInfo, CPU_MANAGER_SNAPSHOT_ID, DEVICE_MANAGER_SNAPSHOT_ID, MEMORY_MANAGER_SNAPSHOT_ID,
 };
@@ -33,9 +33,9 @@ use anyhow::anyhow;
 use arch::get_host_cpu_phys_bits;
 #[cfg(feature = "tdx")]
 use arch::x86_64::tdx::TdvfSection;
-#[cfg(target_arch = "x86_64")]
-use arch::x86_64::SgxEpcSection;
 use arch::EntryPoint;
+#[cfg(any(target_arch = "aarch64", feature = "acpi"))]
+use arch::{NumaNode, NumaNodes};
 use devices::AcpiNotificationFlags;
 use hypervisor::vm::{HypervisorVmError, VmmOps};
 use linux_loader::cmdline::Cmdline;
@@ -44,14 +44,16 @@ use linux_loader::loader::elf::PvhBootCapability::PvhEntryPresent;
 #[cfg(target_arch = "aarch64")]
 use linux_loader::loader::pe::Error::InvalidImageMagicNumber;
 use linux_loader::loader::KernelLoader;
-use seccomp::{SeccompAction, SeccompFilter};
+use seccompiler::{apply_filter, SeccompAction};
 use signal_hook::{
     consts::{SIGINT, SIGTERM, SIGWINCH},
     iterator::backend::Handle,
     iterator::Signals,
 };
 use std::cmp;
-use std::collections::{BTreeMap, HashMap};
+#[cfg(any(target_arch = "aarch64", feature = "acpi"))]
+use std::collections::BTreeMap;
+use std::collections::HashMap;
 use std::convert::TryInto;
 use std::ffi::CString;
 #[cfg(target_arch = "x86_64")]
@@ -214,10 +216,10 @@ pub enum Error {
     InvalidNumaConfig,
 
     /// Cannot create seccomp filter
-    CreateSeccompFilter(seccomp::SeccompError),
+    CreateSeccompFilter(seccompiler::Error),
 
     /// Cannot apply seccomp filter
-    ApplySeccompFilter(seccomp::Error),
+    ApplySeccompFilter(seccompiler::Error),
 
     /// Failed resizing a memory zone.
     ResizeZone,
@@ -263,46 +265,6 @@ pub enum Error {
     FinalizeTdx(hypervisor::HypervisorVmError),
 }
 pub type Result<T> = result::Result<T, Error>;
-
-#[derive(Clone, Default)]
-pub struct NumaNode {
-    memory_regions: Vec<Arc<GuestRegionMmap>>,
-    hotplug_regions: Vec<Arc<GuestRegionMmap>>,
-    cpus: Vec<u8>,
-    distances: BTreeMap<u32, u8>,
-    memory_zones: Vec<String>,
-    #[cfg(target_arch = "x86_64")]
-    sgx_epc_sections: Vec<SgxEpcSection>,
-}
-
-impl NumaNode {
-    pub fn memory_regions(&self) -> &Vec<Arc<GuestRegionMmap>> {
-        &self.memory_regions
-    }
-
-    pub fn hotplug_regions(&self) -> &Vec<Arc<GuestRegionMmap>> {
-        &self.hotplug_regions
-    }
-
-    pub fn cpus(&self) -> &Vec<u8> {
-        &self.cpus
-    }
-
-    pub fn distances(&self) -> &BTreeMap<u32, u8> {
-        &self.distances
-    }
-
-    pub fn memory_zones(&self) -> &Vec<String> {
-        &self.memory_zones
-    }
-
-    #[cfg(target_arch = "x86_64")]
-    pub fn sgx_epc_sections(&self) -> &Vec<SgxEpcSection> {
-        &self.sgx_epc_sections
-    }
-}
-
-pub type NumaNodes = BTreeMap<u32, NumaNode>;
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq)]
 pub enum VmState {
@@ -519,7 +481,7 @@ pub struct Vm {
     vm: Arc<dyn hypervisor::Vm>,
     #[cfg(all(feature = "kvm", target_arch = "x86_64"))]
     saved_clock: Option<hypervisor::ClockData>,
-    #[cfg(feature = "acpi")]
+    #[cfg(any(target_arch = "aarch64", feature = "acpi"))]
     numa_nodes: NumaNodes,
     seccomp_action: SeccompAction,
     exit_evt: EventFd,
@@ -541,6 +503,7 @@ impl Vm {
             hypervisor::ClockData,
         >,
         activate_evt: EventFd,
+        restoring: bool,
     ) -> Result<Self> {
         config
             .lock()
@@ -551,7 +514,7 @@ impl Vm {
         info!("Booting VM from config: {:?}", &config);
 
         // Create NUMA nodes based on NumaConfig.
-        #[cfg(feature = "acpi")]
+        #[cfg(any(target_arch = "aarch64", feature = "acpi"))]
         let numa_nodes =
             Self::create_numa_nodes(config.lock().unwrap().numa.clone(), &memory_manager)?;
 
@@ -567,10 +530,11 @@ impl Vm {
             &exit_evt,
             &reset_evt,
             seccomp_action.clone(),
-            #[cfg(feature = "acpi")]
+            #[cfg(any(target_arch = "aarch64", feature = "acpi"))]
             numa_nodes.clone(),
             &activate_evt,
             force_iommu,
+            restoring,
         )
         .map_err(Error::DeviceManager)?;
 
@@ -604,7 +568,7 @@ impl Vm {
             vm_ops,
             #[cfg(feature = "tdx")]
             tdx_enabled,
-            #[cfg(feature = "acpi")]
+            #[cfg(any(target_arch = "aarch64", feature = "acpi"))]
             &numa_nodes,
         )
         .map_err(Error::CpuManager)?;
@@ -642,7 +606,7 @@ impl Vm {
             vm,
             #[cfg(all(feature = "kvm", target_arch = "x86_64"))]
             saved_clock: _saved_clock,
-            #[cfg(feature = "acpi")]
+            #[cfg(any(target_arch = "aarch64", feature = "acpi"))]
             numa_nodes,
             seccomp_action: seccomp_action.clone(),
             exit_evt,
@@ -651,7 +615,7 @@ impl Vm {
         })
     }
 
-    #[cfg(feature = "acpi")]
+    #[cfg(any(target_arch = "aarch64", feature = "acpi"))]
     fn create_numa_nodes(
         configs: Option<Vec<NumaConfig>>,
         memory_manager: &Arc<Mutex<MemoryManager>>,
@@ -796,6 +760,7 @@ impl Vm {
             #[cfg(all(feature = "kvm", target_arch = "x86_64"))]
             None,
             activate_evt,
+            false,
         )?;
 
         // The device manager must create the devices from here as it is part
@@ -865,6 +830,7 @@ impl Vm {
             #[cfg(all(feature = "kvm", target_arch = "x86_64"))]
             vm_snapshot.clock,
             activate_evt,
+            true,
         )
     }
 
@@ -907,6 +873,7 @@ impl Vm {
             #[cfg(all(feature = "kvm", target_arch = "x86_64"))]
             None,
             activate_evt,
+            true,
         )
     }
 
@@ -1135,6 +1102,7 @@ impl Vm {
             &initramfs_config,
             &pci_space,
             &*gic_device,
+            &self.numa_nodes,
         )
         .map_err(Error::ConfigureSystem)?;
 
@@ -1366,6 +1334,37 @@ impl Vm {
         {
             let mut config = self.config.lock().unwrap();
             Self::add_to_config(&mut config.devices, _device_cfg);
+        }
+
+        self.device_manager
+            .lock()
+            .unwrap()
+            .notify_hotplug(AcpiNotificationFlags::PCI_DEVICES_CHANGED)
+            .map_err(Error::DeviceManager)?;
+
+        Ok(pci_device_info)
+    }
+
+    pub fn add_user_device(&mut self, mut device_cfg: UserDeviceConfig) -> Result<PciDeviceInfo> {
+        {
+            // Validate on a clone of the config
+            let mut config = self.config.lock().unwrap().clone();
+            Self::add_to_config(&mut config.user_devices, device_cfg.clone());
+            config.validate().map_err(Error::ConfigValidation)?;
+        }
+
+        let pci_device_info = self
+            .device_manager
+            .lock()
+            .unwrap()
+            .add_user_device(&mut device_cfg)
+            .map_err(Error::DeviceManager)?;
+
+        // Update VmConfig by adding the new device. This is important to
+        // ensure the device would be created in case of a reboot.
+        {
+            let mut config = self.config.lock().unwrap();
+            Self::add_to_config(&mut config.user_devices, device_cfg);
         }
 
         self.device_manager
@@ -1881,11 +1880,13 @@ impl Vm {
                         thread::Builder::new()
                             .name("signal_handler".to_string())
                             .spawn(move || {
-                                if let Err(e) = SeccompFilter::apply(signal_handler_seccomp_filter)
-                                    .map_err(Error::ApplySeccompFilter)
-                                {
-                                    error!("Error applying seccomp filter: {:?}", e);
-                                    return;
+                                if !signal_handler_seccomp_filter.is_empty() {
+                                    if let Err(e) = apply_filter(&signal_handler_seccomp_filter)
+                                        .map_err(Error::ApplySeccompFilter)
+                                    {
+                                        error!("Error applying seccomp filter: {:?}", e);
+                                        return;
+                                    }
                                 }
 
                                 Vm::os_signal_handler(signals, console, on_tty, exit_evt);
@@ -2443,11 +2444,13 @@ impl Snapshottable for Vm {
                         thread::Builder::new()
                             .name("signal_handler".to_string())
                             .spawn(move || {
-                                if let Err(e) = SeccompFilter::apply(signal_handler_seccomp_filter)
-                                    .map_err(Error::ApplySeccompFilter)
-                                {
-                                    error!("Error applying seccomp filter: {:?}", e);
-                                    return;
+                                if !signal_handler_seccomp_filter.is_empty() {
+                                    if let Err(e) = apply_filter(&signal_handler_seccomp_filter)
+                                        .map_err(Error::ApplySeccompFilter)
+                                    {
+                                        error!("Error applying seccomp filter: {:?}", e);
+                                        return;
+                                    }
                                 }
 
                                 Vm::os_signal_handler(signals, console, on_tty, exit_evt)
@@ -2541,6 +2544,11 @@ impl Migratable for Vm {
             self.memory_manager.lock().unwrap().dirty_log()?,
             self.device_manager.lock().unwrap().dirty_log()?,
         ]))
+    }
+
+    fn complete_migration(&mut self) -> std::result::Result<(), MigratableError> {
+        self.memory_manager.lock().unwrap().complete_migration()?;
+        self.device_manager.lock().unwrap().complete_migration()
     }
 }
 
@@ -2660,6 +2668,7 @@ mod tests {
             &*gic,
             &None,
             &(0x1_0000_0000, 0x1_0000),
+            &BTreeMap::new(),
         )
         .is_ok())
     }

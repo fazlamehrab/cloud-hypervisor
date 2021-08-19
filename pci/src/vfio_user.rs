@@ -271,6 +271,49 @@ impl PciDevice for VfioUserPciDevice {
         self.common
             .write_bar(base, offset, data, &self.vfio_wrapper)
     }
+
+    fn move_bar(&mut self, old_base: u64, new_base: u64) -> Result<(), std::io::Error> {
+        info!("Moving BAR 0x{:x} -> 0x{:x}", old_base, new_base);
+        for mmio_region in self.common.mmio_regions.iter_mut() {
+            if mmio_region.start.raw_value() == old_base {
+                mmio_region.start = GuestAddress(new_base);
+
+                if let Some(mem_slot) = mmio_region.mem_slot {
+                    if let Some(host_addr) = mmio_region.host_addr {
+                        // Remove original region
+                        let old_region = self.vm.make_user_memory_region(
+                            mem_slot,
+                            old_base,
+                            mmio_region.length as u64,
+                            host_addr as u64,
+                            false,
+                            false,
+                        );
+
+                        self.vm
+                            .remove_user_memory_region(old_region)
+                            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+
+                        let new_region = self.vm.make_user_memory_region(
+                            mem_slot,
+                            new_base,
+                            mmio_region.length as u64,
+                            host_addr as u64,
+                            false,
+                            false,
+                        );
+
+                        self.vm
+                            .create_user_memory_region(new_region)
+                            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+                    }
+                }
+                info!("Moved bar 0x{:x} -> 0x{:x}", old_base, new_base);
+            }
+        }
+
+        Ok(())
+    }
 }
 
 impl VfioUserPciDevice {
@@ -342,6 +385,7 @@ impl VfioUserPciDevice {
 
                 mmio_region.mem_slot = Some(slot);
                 mmio_region.host_addr = Some(host_addr as u64);
+                mmio_region.mmap_size = Some(mmio_region.length as usize);
             }
         }
 
@@ -355,18 +399,10 @@ impl VfioUserPciDevice {
                 mmio_region.mmap_size,
                 mmio_region.mem_slot,
             ) {
-                let file_offset = self
-                    .client
-                    .lock()
-                    .unwrap()
-                    .region(mmio_region.index)
-                    .unwrap()
-                    .file_offset
-                    .clone();
                 // Remove region
                 let r = self.vm.make_user_memory_region(
                     mem_slot,
-                    mmio_region.start.raw_value() + file_offset.unwrap().start(),
+                    mmio_region.start.raw_value(),
                     mmap_size as u64,
                     host_addr as u64,
                     false,

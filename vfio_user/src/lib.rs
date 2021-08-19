@@ -410,7 +410,7 @@ impl Client {
             .write_all(dma_unmap.as_slice())
             .map_err(Error::StreamWrite)?;
 
-        let mut reply = Header::default();
+        let mut reply = DmaUnmap::default();
         self.stream
             .read_exact(reply.as_mut_slice())
             .map_err(Error::StreamRead)?;
@@ -501,11 +501,11 @@ impl Client {
                 .map_err(Error::StreamWrite)?;
 
             let mut reply = DeviceGetRegionInfo::default();
-            info!("Reply: {:?}", reply);
             let (_, fd) = self
                 .stream
                 .recv_with_fd(reply.as_mut_slice())
                 .map_err(Error::ReceiveWithFd)?;
+            info!("Reply: {:?}", reply);
 
             regions.push(Region {
                 flags: reply.region_info.flags,

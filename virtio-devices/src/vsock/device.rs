@@ -38,7 +38,7 @@ use crate::{
     VIRTIO_F_IN_ORDER, VIRTIO_F_IOMMU_PLATFORM, VIRTIO_F_VERSION_1,
 };
 use byteorder::{ByteOrder, LittleEndian};
-use seccomp::{SeccompAction, SeccompFilter};
+use seccompiler::{apply_filter, SeccompAction};
 use std::io;
 use std::os::unix::io::AsRawFd;
 use std::path::PathBuf;
@@ -441,9 +441,13 @@ where
         thread::Builder::new()
             .name(self.id.clone())
             .spawn(move || {
-                if let Err(e) = SeccompFilter::apply(virtio_vsock_seccomp_filter) {
-                    error!("Error applying seccomp filter: {:?}", e);
-                } else if let Err(e) = handler.run(paused, paused_sync.unwrap()) {
+                if !virtio_vsock_seccomp_filter.is_empty() {
+                    if let Err(e) = apply_filter(&virtio_vsock_seccomp_filter) {
+                        error!("Error applying seccomp filter: {:?}", e);
+                        return;
+                    }
+                }
+                if let Err(e) = handler.run(paused, paused_sync.unwrap()) {
                     error!("Error running worker: {:?}", e);
                 }
             })

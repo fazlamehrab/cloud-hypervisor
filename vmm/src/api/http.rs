@@ -8,7 +8,7 @@ use crate::api::{ApiError, ApiRequest, VmAction};
 use crate::seccomp_filters::{get_seccomp_filter, Thread};
 use crate::{Error, Result};
 use micro_http::{Body, HttpServer, MediaType, Method, Request, Response, StatusCode, Version};
-use seccomp::{SeccompAction, SeccompFilter};
+use seccompiler::{apply_filter, SeccompAction};
 use serde_json::Error as SerdeError;
 use std::collections::HashMap;
 use std::fs::File;
@@ -76,6 +76,9 @@ pub enum HttpError {
 
     /// Could not add a device to a VM
     VmAddDevice(ApiError),
+
+    /// Could not add a user device to the VM
+    VmAddUserDevice(ApiError),
 
     /// Could not remove a device from a VM
     VmRemoveDevice(ApiError),
@@ -207,6 +210,7 @@ lazy_static! {
         };
 
         r.routes.insert(endpoint!("/vm.add-device"), Box::new(VmActionHandler::new(VmAction::AddDevice(Arc::default()))));
+        r.routes.insert(endpoint!("/vm.add-user-device"), Box::new(VmActionHandler::new(VmAction::AddUserDevice(Arc::default()))));
         r.routes.insert(endpoint!("/vm.add-disk"), Box::new(VmActionHandler::new(VmAction::AddDisk(Arc::default()))));
         r.routes.insert(endpoint!("/vm.add-fs"), Box::new(VmActionHandler::new(VmAction::AddFs(Arc::default()))));
         r.routes.insert(endpoint!("/vm.add-net"), Box::new(VmActionHandler::new(VmAction::AddNet(Arc::default()))));
@@ -272,7 +276,9 @@ fn start_http_thread(
         .name("http-server".to_string())
         .spawn(move || {
             // Apply seccomp filter for API thread.
-            SeccompFilter::apply(api_seccomp_filter).map_err(Error::ApplySeccompFilter)?;
+            if !api_seccomp_filter.is_empty() {
+                apply_filter(&api_seccomp_filter).map_err(Error::ApplySeccompFilter)?;
+            }
 
             server.start_server().unwrap();
             loop {
